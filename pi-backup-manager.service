@@ -1,0 +1,19 @@
+[Unit]
+Description=Pi Backup Manager Web UI
+After=network.target
+After=docker.socket
+Wants=docker.socket
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/pi-backup-manager
+ExecStart=/usr/bin/python3 /home/%i/pi-backup-manager/server.py
+Restart=on-failure
+RestartSec=5
+Environment=PBM_HOST=0.0.0.0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
