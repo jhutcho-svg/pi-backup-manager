@@ -234,6 +234,50 @@ def sh(cmd, timeout=30):
 def sudo(cmd, timeout=30):
     return sh(f"sudo {cmd}", timeout=timeout)
 
+# ── Input validation helpers ──────────────────────────────────────────────────
+
+def _valid_mount_path(path):
+    """Absolute path containing only safe characters."""
+    return bool(path and re.match(r'^/[a-zA-Z0-9/_.\-]+$', path))
+
+def _valid_hostname(s):
+    """Hostname or IP address."""
+    return bool(s and re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9.\-]{0,253}[a-zA-Z0-9])?$', s))
+
+def _valid_share(s):
+    """SMB share name or NFS export path."""
+    return bool(s and re.match(r'^[a-zA-Z0-9/_.\-]+$', s))
+
+def _valid_device(s):
+    """Block device path, e.g. /dev/sda1."""
+    return bool(s and re.match(r'^/dev/[a-zA-Z0-9]+$', s))
+
+def _valid_iqn(s):
+    """iSCSI IQN per RFC 3720."""
+    return bool(s and re.match(
+        r'^(iqn\.\d{4}-\d{2}\.[a-z0-9.\-]+:[a-zA-Z0-9._:\-]*'
+        r'|eui\.[0-9a-fA-F]{16}'
+        r'|naa\.[0-9a-fA-F]{16,32})$', s))
+
+def _valid_port(s):
+    """Numeric port 1–65535."""
+    try:
+        return 1 <= int(str(s)) <= 65535
+    except (ValueError, TypeError):
+        return False
+
+def _valid_fstype(s):
+    """Allowlisted filesystem types."""
+    return s in {"ext4", "ext3", "ext2", "xfs", "btrfs", "vfat", "ntfs", "exfat", "f2fs"}
+
+def _valid_script_path(path):
+    """Path must resolve within the user's home directory."""
+    try:
+        resolved = Path(path).resolve()
+        return resolved.is_relative_to(Path.home().resolve())
+    except Exception:
+        return False
+
 def docker_ok():
     _, _, rc = sh("docker info 2>/dev/null")
     return rc == 0
@@ -303,6 +347,8 @@ def api_config_post():
 @app.route("/api/mount/status")
 def api_mount_status():
     path = request.args.get("path", "")
+    if not _valid_mount_path(path):
+        return jsonify({"error": "Invalid path"}), 400
     mounted = is_mounted(path)
     df = fstype = source = transport = ""
     if mounted:
@@ -324,6 +370,9 @@ def api_mount_do():
     action = d.get("action", "mount")    # "mount" | "unmount"
     path   = d.get("mountPoint", "")
 
+    if not _valid_mount_path(path):
+        return jsonify({"error": "Invalid mount path"}), 400
+
     if action == "unmount":
         _, err, rc = sudo(f"umount {path}")
         return jsonify({"ok": rc == 0, "error": err if rc else ""})
@@ -337,8 +386,14 @@ def api_mount_do():
         domain  = d.get("smbDomain","WORKGROUP")
         ver     = d.get("smbVersion","3.0")
         extra   = d.get("smbExtraOpts","")
+        if not _valid_hostname(server):
+            return jsonify({"error": "Invalid SMB server"}), 400
+        if not _valid_share(share):
+            return jsonify({"error": "Invalid SMB share"}), 400
         opts    = f"username={user},password={pw},domain={domain},vers={ver},uid=1000,gid=1000"
         if extra:
+            if not re.match(r'^[a-zA-Z0-9=,._\-]+$', extra):
+                return jsonify({"error": "Invalid SMB extra options"}), 400
             opts += "," + extra
         sudo(f"mkdir -p {path}")
         _, err, rc = sudo(f'mount -t cifs //{server}/{share} {path} -o "{opts}"', timeout=20)
@@ -347,17 +402,29 @@ def api_mount_do():
         export  = d.get("nfsExport","")
         opts    = d.get("nfsMountOpts","vers=4,rw,sync")
         custom  = d.get("nfsCustomOpts","")
+        if not _valid_hostname(server):
+            return jsonify({"error": "Invalid NFS server"}), 400
+        if not _valid_share(export):
+            return jsonify({"error": "Invalid NFS export path"}), 400
         if custom:
+            if not re.match(r'^[a-zA-Z0-9=,._\-]+$', custom):
+                return jsonify({"error": "Invalid NFS custom options"}), 400
             opts += "," + custom
         sudo(f"mkdir -p {path}")
         _, err, rc = sudo(f"mount -t nfs {server}:{export} {path} -o {opts}", timeout=20)
     elif dest == "usb":
         device = d.get("usbDevice","")
         fstype = d.get("usbFsType","ext4")
+        if not _valid_device(device):
+            return jsonify({"error": "Invalid device path"}), 400
+        if not _valid_fstype(fstype):
+            return jsonify({"error": "Unsupported filesystem type"}), 400
         sudo(f"mkdir -p {path}")
         _, err, rc = sudo(f"mount -t {fstype} {device} {path}", timeout=15)
     elif dest == "iscsi":
         device = d.get("iscsiDevice","")
+        if not _valid_device(device):
+            return jsonify({"error": "Invalid device path"}), 400
         sudo(f"mkdir -p {path}")
         _, err, rc = sudo(f"mount {device} {path}", timeout=15)
     else:
@@ -457,8 +524,10 @@ def api_iscsi_discover():
     d      = request.get_json(force=True)
     portal = d.get("portal","").strip()
     port   = d.get("port","3260")
-    if not portal or not re.match(r'^[\w.\-]+$', portal):
+    if not _valid_hostname(portal):
         return jsonify({"error": "Invalid portal address"}), 400
+    if not _valid_port(port):
+        return jsonify({"error": "Invalid port"}), 400
     out, err, rc = sudo(f"iscsiadm -m discovery -t sendtargets -p {portal}:{port} 2>&1", timeout=15)
     if rc != 0:
         if "not found" in err.lower() or "not found" in out.lower():
@@ -477,8 +546,12 @@ def api_iscsi_login():
     portal = d.get("portal","").strip()
     iqn    = d.get("iqn","").strip()
     port   = d.get("port","3260")
-    if not portal or not iqn:
-        return jsonify({"error": "Portal and IQN required"}), 400
+    if not _valid_hostname(portal):
+        return jsonify({"error": "Invalid portal address"}), 400
+    if not _valid_iqn(iqn):
+        return jsonify({"error": "Invalid IQN format"}), 400
+    if not _valid_port(port):
+        return jsonify({"error": "Invalid port"}), 400
     out, err, rc = sudo(f"iscsiadm -m node -T {iqn} -p {portal}:{port} --login 2>&1", timeout=20)
     if rc != 0 and "already" not in out.lower():
         return jsonify({"error": err or out or "Login failed"}), 500
@@ -495,6 +568,8 @@ def api_iscsi_login():
 def api_iscsi_logout():
     d   = request.get_json(force=True)
     iqn = d.get("iqn","").strip()
+    if not _valid_iqn(iqn):
+        return jsonify({"error": "Invalid IQN format"}), 400
     out, err, rc = sudo(f"iscsiadm -m node -T {iqn} --logout 2>&1", timeout=15)
     return jsonify({"ok": rc == 0, "message": out, "error": err if rc else ""})
 
@@ -503,8 +578,8 @@ def api_iscsi_autostart():
     d      = request.get_json(force=True)
     iqn    = d.get("iqn","").strip()
     enable = d.get("enable", True)
-    if not iqn:
-        return jsonify({"error": "IQN required"}), 400
+    if not _valid_iqn(iqn):
+        return jsonify({"error": "Invalid IQN format"}), 400
     value = "automatic" if enable else "manual"
     out, err, rc = sudo(f"iscsiadm -m node -T {iqn} --op update -n node.startup -v {value} 2>&1", timeout=10)
     if rc != 0:
@@ -566,8 +641,8 @@ def api_usb_scan():
 def api_usb_uuid():
     """Return the UUID for a block device, for stable fstab entries."""
     device = request.args.get("device","").strip()
-    if not device:
-        return jsonify({"error": "device required"}), 400
+    if not _valid_device(device):
+        return jsonify({"error": "Invalid device path"}), 400
     out, _, rc = sh(f"blkid -s UUID -o value {device} 2>/dev/null")
     uuid = out.strip()
     if rc != 0 or not uuid:
@@ -630,11 +705,13 @@ def api_cron_remove():
 @app.route("/api/script", methods=["GET"])
 def api_script_read():
     path = request.args.get("path", str(Path.home() / "weekly_image.sh"))
-    p = Path(path)
+    if not _valid_script_path(path):
+        return jsonify({"error": "Path not allowed"}), 403
+    p = Path(path).resolve()
     if not p.exists():
-        return jsonify({"error": f"Script not found: {path}"}), 404
+        return jsonify({"error": "Script not found"}), 404
     try:
-        return jsonify({"ok": True, "path": path, "script": p.read_text()})
+        return jsonify({"ok": True, "path": str(p), "script": p.read_text()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -645,13 +722,15 @@ def api_script():
     path    = d.get("path", str(Path.home() / "weekly_image.sh"))
     if not content:
         return jsonify({"error": "No script content"}), 400
+    if not _valid_script_path(path):
+        return jsonify({"error": "Path not allowed"}), 403
     try:
-        p = Path(path)
+        p = Path(path).resolve()
         p.write_text(content)
         p.chmod(0o755)
-        return jsonify({"ok": True, "path": path})
+        return jsonify({"ok": True, "path": str(p)})
     except PermissionError:
-        return jsonify({"error": f"Permission denied writing {path}"}), 403
+        return jsonify({"error": "Permission denied writing script"}), 403
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
