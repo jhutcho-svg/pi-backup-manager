@@ -40,6 +40,7 @@ You configure your backup destination, schedule, and notification settings throu
 - Flask (`sudo apt install python3-flask`)
 - `sudo` access for the running user
 - [RonR image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils) — installable via the GUI
+- **Optional:** `zerofree` (`sudo apt install zerofree`) — for fast Compact Image; falls back to slower dd method without it
 - **Optional:** Runtipi, SMB/NFS/iSCSI target, [ntfy.sh](https://ntfy.sh) account
 
 ---

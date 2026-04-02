@@ -687,8 +687,8 @@ def api_cron_post():
     lines += [f"# Pi Backup Manager — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
               f"{cron_line} {script_path} >> {log_path} 2>&1"]
     new_tab = "\n".join(lines) + "\n"
-    _, err, rc = sh(f'echo {repr(new_tab)} | crontab -')
-    return jsonify({"ok": rc == 0, "error": err if rc else ""})
+    r = subprocess.run(["crontab", "-"], input=new_tab, text=True, capture_output=True)
+    return jsonify({"ok": r.returncode == 0, "error": r.stderr if r.returncode else ""})
 
 @app.route("/api/cron/remove", methods=["POST"])
 def api_cron_remove():
@@ -1138,9 +1138,9 @@ def api_image_status():
         try: result["source_used_mb"] = int(out.strip().rstrip("M"))
         except Exception: pass
 
-    wasted = result["logical_mb"] - result["source_used_mb"] - headroom_mb
+    wasted = result["sparse_mb"] - result["source_used_mb"] - headroom_mb
     result["wasted_mb"]           = max(0, wasted)
-    result["compact_recommended"] = wasted > 500
+    result["compact_recommended"] = wasted > result["source_used_mb"] * 0.40
     return jsonify(result)
 
 
@@ -1213,7 +1213,7 @@ def _run_compact_thread(image_path):
                 emit(f"  mount failed ({err_mnt}) — skipping zero-fill, holes may be limited", "warn")
             else:
                 emit("  Writing zeros to free space — this may take several minutes …", "info")
-                sh(f"sudo dd if=/dev/zero of={mnt}/zero.tmp bs=1M 2>/dev/null || true", timeout=600)
+                sh(f"sudo dd if=/dev/zero of={mnt}/zero.tmp bs=1M 2>/dev/null || true", timeout=3600)
                 sh(f"sudo rm -f {mnt}/zero.tmp")
                 sh(f"sudo umount {mnt}", timeout=30)
                 emit("  Zero-fill complete.", "ok")
@@ -1291,6 +1291,40 @@ def api_compact_stream():
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
+
+@app.route("/api/cleanup", methods=["POST"])
+def api_cleanup():
+    """Delete selected backup artefacts: sentinel, lock file, compact temp, image file."""
+    cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    mount_point = cfg.get("mountPoint", "/mnt/backups")
+    image_name  = cfg.get("imageName",  "pi_backup.img")
+    lock_file   = cfg.get("lockFile",   "/tmp/weekly_image.lock")
+    d = request.get_json(force=True, silent=True) or {}
+    targets = d.get("targets", [])
+    results = {}
+    if "sentinel" in targets:
+        p = Path(mount_point) / ".image_initialised"
+        try:
+            if p.exists(): p.unlink(); results["sentinel"] = "deleted"
+            else: results["sentinel"] = "not found"
+        except Exception as e: results["sentinel"] = f"error: {e}"
+    if "lock" in targets:
+        p = Path(lock_file)
+        try:
+            if p.exists(): p.unlink(); results["lock"] = "deleted"
+            else: results["lock"] = "not found"
+        except Exception as e: results["lock"] = f"error: {e}"
+    if "compact_tmp" in targets:
+        mnt = Path("/tmp/pbm_compact_mnt")
+        _, _, rc = sh("sudo umount -l /tmp/pbm_compact_mnt 2>/dev/null; sudo rm -rf /tmp/pbm_compact_mnt", timeout=15)
+        results["compact_tmp"] = "cleaned" if rc == 0 else "cleaned (best-effort)"
+    if "image" in targets:
+        p = Path(mount_point) / image_name
+        try:
+            if p.exists(): p.unlink(); results["image"] = "deleted"
+            else: results["image"] = "not found"
+        except Exception as e: results["image"] = f"error: {e}"
+    return jsonify({"ok": True, "results": results})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — Dependency check & install
@@ -2276,6 +2310,32 @@ textarea{resize:vertical;line-height:1.6}
     </div>
   </div>
 
+  <!-- Cleanup / Reset -->
+  <div class="card">
+    <div class="card-hdr">
+      <div class="card-title"><span class="icon">🧹</span> Reset &amp; Cleanup</div>
+    </div>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.7">Delete backup artefacts to rebase to a fresh image or recover from a failed run. Select what to remove then click Clean Up.</p>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;font-size:13px">
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-sentinel"> <span><strong>Sentinel file</strong> <code>.image_initialised</code> — forces a full rebase on next backup run</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-lock"> <span><strong>Lock file</strong> — clears a stuck lock from a previously aborted run</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-compact-tmp"> <span><strong>Compact temp mount</strong> <code>/tmp/pbm_compact_mnt</code> — cleans up orphaned loop mounts</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--red,#f87171)">
+        <input type="checkbox" id="cl-image"> <span><strong>Image file</strong> <code id="cl-image-label"></code> — permanently deletes the backup image ⚠️</span>
+      </label>
+    </div>
+    <div class="row" style="gap:8px;align-items:center">
+      <button class="btn" style="background:var(--orange)" onclick="runCleanup()">🧹 Clean Up Selected</button>
+      <span id="cleanup-status" style="font-size:12px"></span>
+    </div>
+  </div>
+
   <!-- Manual Run -->
   <div class="card">
     <div class="card-hdr">
@@ -2720,6 +2780,9 @@ function updatePreviews() {
   // Update restore image path placeholder
   const rip = document.getElementById("restoreImagePath");
   if (rip && !rip.value) rip.placeholder = full;
+  // Update cleanup image label
+  const cl = document.getElementById("cl-image-label");
+  if (cl) cl.textContent = full;
 }
 updatePreviews();
 
@@ -4417,6 +4480,35 @@ function dismissCompactBanner() {
   document.getElementById("compact-banner").style.display = "none";
 }
 
+async function runCleanup() {
+  const targets = [];
+  if (document.getElementById("cl-sentinel").checked)    targets.push("sentinel");
+  if (document.getElementById("cl-lock").checked)        targets.push("lock");
+  if (document.getElementById("cl-compact-tmp").checked) targets.push("compact_tmp");
+  if (document.getElementById("cl-image").checked) {
+    if (!confirm("Permanently delete the backup image file? This cannot be undone.")) return;
+    targets.push("image");
+  }
+  if (!targets.length) { toast("Nothing selected", "warn"); return; }
+  const statusEl = document.getElementById("cleanup-status");
+  statusEl.textContent = "Working…";
+  try {
+    const r = await fetch("/api/cleanup", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ targets })
+    });
+    const j = await r.json();
+    if (!r.ok) { toast(j.error || "Cleanup failed", "err"); statusEl.textContent = ""; return; }
+    const summary = Object.entries(j.results).map(([k,v]) => `${k}: ${v}`).join(" · ");
+    statusEl.textContent = "✓ " + summary;
+    // uncheck all
+    ["cl-sentinel","cl-lock","cl-compact-tmp","cl-image"].forEach(id => {
+      document.getElementById(id).checked = false;
+    });
+    toast("Cleanup complete", "ok");
+  } catch(e) { toast(e.message, "err"); statusEl.textContent = ""; }
+}
+
 function clearCompactLog() {
   document.getElementById("compact-log").innerHTML = "";
   document.getElementById("compact-log-wrap").style.display = "none";
@@ -4429,7 +4521,7 @@ async function startCompact() {
   if (_compactSSE) { _compactSSE.close(); _compactSSE = null; }
   const vip = document.getElementById("verifyImagePath");
   const imagePath = (vip && vip.value.trim()) ||
-    ((S.config?.mountPoint || "/mnt/backups").replace(/\/$/, "") + "/" + (S.config?.imageName || "pi_backup.img"));
+    (getMountPoint().replace(/\/$/, "") + "/" + getImageName());
 
   const logEl    = document.getElementById("compact-log");
   const wrapEl   = document.getElementById("compact-log-wrap");
@@ -4480,7 +4572,7 @@ async function startCompact() {
       resBadge.style.display = "";
       resBadge.className = "badge " + (ok ? "green" : "red");
       resBadge.textContent = ok ? "Compacted" : "Failed";
-      if (ok) { _compactBannerDismissed = false; checkImageStatus(); }
+      if (ok) { _compactBannerDismissed = true; checkImageStatus(); }
     }
   };
   _compactSSE.onerror = () => {

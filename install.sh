@@ -69,6 +69,16 @@ else
     info "Flask already present."
 fi
 
+# ── Install zerofree ─────────────────────────────────────────────────────────
+step "Checking for zerofree…"
+if command -v zerofree >/dev/null 2>&1; then
+    info "zerofree already installed."
+else
+    info "Installing zerofree (used by Compact Image feature)…"
+    sudo apt-get install -y zerofree -q \
+        || warn "zerofree install failed — Compact Image will use slower fallback method."
+fi
+
 # ── Install image-backup (RonR RPi-image-utils) ───────────────────────────────
 step "Checking for image-backup…"
 if [[ -x "$IMGBAK_BIN" ]]; then
