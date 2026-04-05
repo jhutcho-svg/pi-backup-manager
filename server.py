@@ -5,7 +5,7 @@ Run with: python3 pi_backup_manager.py
 Then open: http://<pi-ip>:7823
 """
 
-import base64, hashlib, json, os, re, secrets, subprocess, tempfile, threading, time, queue, calendar
+import base64, hashlib, json, os, re, secrets, shlex, subprocess, tempfile, threading, time, queue, calendar
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify, request, Response
@@ -1292,6 +1292,87 @@ def api_compact_stream():
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 
+@app.route("/api/dashboard")
+def api_dashboard():
+    """Aggregate status for dashboard: last backup, image, mount, cron."""
+    cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    mount_point = cfg.get("mountPoint", "/mnt/backups")
+    image_name  = cfg.get("imageName",  "pi_backup.img")
+    log_path    = cfg.get("logPath",    str(Path.home() / "cron_debug.log"))
+    lock_file   = cfg.get("lockFile",   "/tmp/weekly_image.lock")
+
+    # ── Last backup (reuse existing logic) ───────────────────────────────────
+    import flask
+    with flask.current_app.test_request_context():
+        last_raw = api_backup_last().get_json()
+
+    # ── Image status ──────────────────────────────────────────────────────────
+    image_path = Path(mount_point) / image_name
+    image_info = {"exists": False}
+    if image_path.exists():
+        try:
+            st   = image_path.stat()
+            logical_mb = st.st_size // (1024 * 1024)
+            _, out, _ = sh(f"du -s --block-size=1M {shlex.quote(str(image_path))}")
+            sparse_mb  = int(out.split()[0]) if out.strip() else logical_mb
+            image_info = {
+                "exists": True,
+                "logical_mb": logical_mb,
+                "sparse_mb":  sparse_mb,
+                "wasted_mb":  logical_mb - sparse_mb,
+                "compact_recommended": (logical_mb - sparse_mb) > 500,
+            }
+        except Exception:
+            image_info = {"exists": True}
+
+    # ── Sentinel / lock ───────────────────────────────────────────────────────
+    sentinel_exists = (Path(mount_point) / ".image_initialised").exists()
+    lock_exists     = Path(lock_file).exists()
+
+    # ── Mount status ──────────────────────────────────────────────────────────
+    mount_info = {"mounted": False}
+    try:
+        _, out, rc = sh(f"findmnt -rn -o TARGET,SOURCE,FSTYPE {shlex.quote(mount_point)}")
+        if rc == 0 and out.strip():
+            parts = out.strip().split()
+            mount_info = {
+                "mounted": True,
+                "source":  parts[1] if len(parts) > 1 else "",
+                "fstype":  parts[2] if len(parts) > 2 else "",
+            }
+    except Exception:
+        pass
+
+    # ── Cron schedule ─────────────────────────────────────────────────────────
+    cron_info = {"installed": False, "expr": "", "human": ""}
+    try:
+        script_path = cfg.get("scriptPath", str(Path.home() / "weekly_image.sh"))
+        _, out, rc  = sh("crontab -l 2>/dev/null")
+        for line in (out or "").splitlines():
+            if script_path in line and not line.strip().startswith("#"):
+                parts = line.strip().split()
+                cron_info = {
+                    "installed": True,
+                    "expr":  " ".join(parts[:5]) if len(parts) >= 5 else line.strip(),
+                    "human": cfg.get("cronHuman", ""),
+                }
+                break
+        if not cron_info["human"]:
+            cron_info["human"] = cfg.get("cronExpr", "")
+    except Exception:
+        pass
+
+    return jsonify({
+        "last":     last_raw,
+        "image":    image_info,
+        "mount":    mount_info,
+        "cron":     cron_info,
+        "sentinel": sentinel_exists,
+        "lock":     lock_exists,
+        "running":  _backup_status.get("running", False),
+    })
+
+
 @app.route("/api/cleanup", methods=["POST"])
 def api_cleanup():
     """Delete selected backup artefacts: sentinel, lock file, compact temp, image file."""
@@ -1303,27 +1384,19 @@ def api_cleanup():
     targets = d.get("targets", [])
     results = {}
     if "sentinel" in targets:
-        p = Path(mount_point) / ".image_initialised"
-        try:
-            if p.exists(): p.unlink(); results["sentinel"] = "deleted"
-            else: results["sentinel"] = "not found"
-        except Exception as e: results["sentinel"] = f"error: {e}"
+        p = str(Path(mount_point) / ".image_initialised")
+        _, _, rc = sh(f"sudo rm -f {shlex.quote(p)}", timeout=10)
+        results["sentinel"] = "deleted" if rc == 0 else "not found or error"
     if "lock" in targets:
-        p = Path(lock_file)
-        try:
-            if p.exists(): p.unlink(); results["lock"] = "deleted"
-            else: results["lock"] = "not found"
-        except Exception as e: results["lock"] = f"error: {e}"
+        _, _, rc = sh(f"sudo rm -f {shlex.quote(lock_file)}", timeout=10)
+        results["lock"] = "deleted" if rc == 0 else "not found or error"
     if "compact_tmp" in targets:
-        mnt = Path("/tmp/pbm_compact_mnt")
         _, _, rc = sh("sudo umount -l /tmp/pbm_compact_mnt 2>/dev/null; sudo rm -rf /tmp/pbm_compact_mnt", timeout=15)
         results["compact_tmp"] = "cleaned" if rc == 0 else "cleaned (best-effort)"
     if "image" in targets:
-        p = Path(mount_point) / image_name
-        try:
-            if p.exists(): p.unlink(); results["image"] = "deleted"
-            else: results["image"] = "not found"
-        except Exception as e: results["image"] = f"error: {e}"
+        p = str(Path(mount_point) / image_name)
+        _, _, rc = sh(f"sudo rm -f {shlex.quote(p)}", timeout=30)
+        results["image"] = "deleted" if rc == 0 else "not found or error"
     return jsonify({"ok": True, "results": results})
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1713,7 +1786,7 @@ select option{background:var(--bg3)}
 .hdr-meta{display:flex;align-items:center;gap:16px}
 
 .tabbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:0 32px}
-.tabbar-inner{max-width:1160px;margin:0 auto;display:flex;gap:4px}
+.tabbar-inner{max-width:1160px;margin:0 auto;display:flex;gap:4px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabbar-inner::-webkit-scrollbar{display:none}
 .tab-btn{padding:14px 20px;background:transparent;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:13px;font-weight:600;font-family:'JetBrains Mono',monospace;cursor:pointer;display:flex;align-items:center;gap:7px;transition:color .15s;letter-spacing:.02em;white-space:nowrap}
 .tab-btn.active{border-bottom-color:var(--accent);color:var(--accent)}
 .tab-btn:hover:not(.active){color:var(--text)}
@@ -1854,6 +1927,20 @@ textarea{resize:vertical;line-height:1.6}
 #toast.show{opacity:1}
 #toast.ok{background:rgba(16,185,129,.15);border-color:var(--green);color:var(--green)}
 #toast.err{background:rgba(239,68,68,.15);border-color:var(--red);color:var(--red)}
+
+@media(max-width:640px){
+  .hdr{padding:0 12px}
+  .hdr-inner{height:52px}
+  .tabbar{padding:0 12px}
+  .content{padding:16px 12px}
+  .card{padding:16px}
+  .g2,.g3{grid-template-columns:1fr}
+  .dest-grid{grid-template-columns:repeat(3,1fr)}
+  .ct-head{display:none}
+  .ct-row{grid-template-columns:1fr 1fr;gap:4px;padding:10px 12px}
+  .phase-bar{grid-template-columns:repeat(2,1fr)}
+  .cl-row-wrap{flex-wrap:wrap}
+}
 </style>
 </head>
 <body>
@@ -1882,6 +1969,7 @@ textarea{resize:vertical;line-height:1.6}
 <!-- TABBAR -->
 <div class="tabbar">
   <div class="tabbar-inner">
+    <button class="tab-btn" data-tab="dashboard">📊 Dashboard</button>
     <button class="tab-btn active" data-tab="destination">🗄️ Destination</button>
     <button class="tab-btn" data-tab="containers">🐳 Containers</button>
     <button class="tab-btn" data-tab="schedule">📅 Schedule</button>
@@ -1892,6 +1980,123 @@ textarea{resize:vertical;line-height:1.6}
 
 <!-- CONTENT -->
 <div class="content">
+
+<!-- ═══════════════════════ DASHBOARD TAB ═══════════════════════ -->
+<div class="pane" id="tab-dashboard">
+
+  <!-- Row 1: Last Backup + Mount -->
+  <div class="g2">
+    <!-- Last Backup -->
+    <div class="card" style="margin-bottom:0">
+      <div class="card-hdr" style="margin-bottom:14px">
+        <div class="card-title"><span class="icon">💾</span> Last Backup</div>
+        <span id="db-backup-badge" class="badge muted"><span class="dot"></span><span id="db-backup-badge-txt">—</span></span>
+      </div>
+      <div style="font-size:13px;display:flex;flex-direction:column;gap:8px">
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Started</span>
+          <span id="db-started">—</span>
+        </div>
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Finished</span>
+          <span id="db-finished">—</span>
+        </div>
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Duration</span>
+          <span id="db-elapsed">—</span>
+        </div>
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Mode</span>
+          <span id="db-mode">—</span>
+        </div>
+      </div>
+      <div id="db-log-wrap" style="display:none;margin-top:14px">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.06em;text-transform:uppercase">Last log lines</div>
+        <div class="term-box" id="db-log" style="max-height:160px;overflow-y:auto;font-size:11px"></div>
+      </div>
+    </div>
+
+    <!-- Mount + Image -->
+    <div style="display:flex;flex-direction:column;gap:20px">
+      <div class="card" style="margin-bottom:0">
+        <div class="card-hdr" style="margin-bottom:14px">
+          <div class="card-title"><span class="icon">💿</span> Mount</div>
+          <span id="db-mount-badge" class="badge muted"><span class="dot"></span><span id="db-mount-badge-txt">—</span></span>
+        </div>
+        <div style="font-size:13px;display:flex;flex-direction:column;gap:7px">
+          <div class="row" style="gap:10px">
+            <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Source</span>
+            <code id="db-mount-src" style="font-size:12px;word-break:break-all">—</code>
+          </div>
+          <div class="row" style="gap:10px">
+            <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">FS Type</span>
+            <span id="db-mount-fs">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:0">
+        <div class="card-hdr" style="margin-bottom:14px">
+          <div class="card-title"><span class="icon">🗂️</span> Image</div>
+          <span id="db-image-badge" class="badge muted"><span class="dot"></span><span id="db-image-badge-txt">—</span></span>
+        </div>
+        <div style="font-size:13px;display:flex;flex-direction:column;gap:7px">
+          <div class="row" style="gap:10px">
+            <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Logical</span>
+            <span id="db-img-logical">—</span>
+          </div>
+          <div class="row" style="gap:10px">
+            <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">On disk</span>
+            <span id="db-img-sparse">—</span>
+          </div>
+          <div class="row" style="gap:10px">
+            <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Sentinel</span>
+            <span id="db-sentinel">—</span>
+          </div>
+          <div id="db-compact-warn" style="display:none;margin-top:4px" class="info orange">⚠️ Compaction recommended — significant sparse space reclaimed.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row 2: Schedule + State pills -->
+  <div class="g2" style="margin-top:20px">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-hdr" style="margin-bottom:14px">
+        <div class="card-title"><span class="icon">📅</span> Schedule</div>
+        <span id="db-cron-badge" class="badge muted"><span class="dot"></span><span id="db-cron-badge-txt">—</span></span>
+      </div>
+      <div style="font-size:13px;display:flex;flex-direction:column;gap:7px">
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Cron</span>
+          <code id="db-cron-expr" style="font-size:12px">—</code>
+        </div>
+        <div class="row" style="gap:10px">
+          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Next run</span>
+          <span id="db-cron-next">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:0">
+      <div class="card-hdr" style="margin-bottom:14px">
+        <div class="card-title"><span class="icon">⚙️</span> State</div>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px">
+        <span id="db-pill-running"  class="badge muted">Backup idle</span>
+        <span id="db-pill-lock"     class="badge muted">No lock</span>
+        <span id="db-pill-sentinel" class="badge muted">No sentinel</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Refresh -->
+  <div style="margin-top:20px;display:flex;align-items:center;gap:12px">
+    <button class="btn secondary sm" onclick="loadDashboard()">🔄 Refresh</button>
+    <span id="db-refresh-ts" style="font-size:11px;color:var(--muted)"></span>
+  </div>
+
+</div>
 
 <!-- ═══════════════════════ DESTINATION TAB ═══════════════════════ -->
 <div class="pane active" id="tab-destination">
@@ -2317,20 +2522,23 @@ textarea{resize:vertical;line-height:1.6}
     </div>
     <p style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.7">Delete backup artefacts to rebase to a fresh image or recover from a failed run. Select what to remove then click Clean Up.</p>
     <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;font-size:13px">
-      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
-        <input type="checkbox" id="cl-sentinel"> <span><strong>Sentinel file</strong> <code>.image_initialised</code> — forces a full rebase on next backup run</span>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding-bottom:6px;border-bottom:1px solid var(--border,#334)">
+        <input type="checkbox" id="cl-all" onchange="clToggleAll(this.checked)" style="flex-shrink:0"> <span style="color:var(--muted)">Select all</span>
       </label>
-      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
-        <input type="checkbox" id="cl-lock"> <span><strong>Lock file</strong> — clears a stuck lock from a previously aborted run</span>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-sentinel" onchange="clSyncAll()" style="flex-shrink:0;margin-top:2px"> <span><strong>Sentinel file</strong> <code style="word-break:break-all">.image_initialised</code> — forces a full rebase on next backup run</span>
       </label>
-      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
-        <input type="checkbox" id="cl-compact-tmp"> <span><strong>Compact temp mount</strong> <code>/tmp/pbm_compact_mnt</code> — cleans up orphaned loop mounts</span>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-lock" onchange="clSyncAll()" style="flex-shrink:0;margin-top:2px"> <span><strong>Lock file</strong> — clears a stuck lock from a previously aborted run</span>
       </label>
-      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--red,#f87171)">
-        <input type="checkbox" id="cl-image"> <span><strong>Image file</strong> <code id="cl-image-label"></code> — permanently deletes the backup image ⚠️</span>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cl-compact-tmp" onchange="clSyncAll()" style="flex-shrink:0;margin-top:2px"> <span><strong>Compact temp mount</strong> <code style="word-break:break-all">/tmp/pbm_compact_mnt</code> — cleans up orphaned loop mounts</span>
+      </label>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;color:var(--red,#f87171)">
+        <input type="checkbox" id="cl-image" onchange="clSyncAll()" style="flex-shrink:0;margin-top:2px"> <span><strong>Image file</strong> <code id="cl-image-label" style="word-break:break-all"></code> — permanently deletes the backup image ⚠️</span>
       </label>
     </div>
-    <div class="row" style="gap:8px;align-items:center">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
       <button class="btn" style="background:var(--orange)" onclick="runCleanup()">🧹 Clean Up Selected</button>
       <span id="cleanup-status" style="font-size:12px"></span>
     </div>
@@ -2780,9 +2988,9 @@ function updatePreviews() {
   // Update restore image path placeholder
   const rip = document.getElementById("restoreImagePath");
   if (rip && !rip.value) rip.placeholder = full;
-  // Update cleanup image label
+  // Update cleanup image label (wildcard — image name may vary)
   const cl = document.getElementById("cl-image-label");
-  if (cl) cl.textContent = full;
+  if (cl) cl.textContent = (getMountPoint() || "/mnt/backups").replace(/\/$/, "") + "/*.img";
 }
 updatePreviews();
 
@@ -4480,6 +4688,14 @@ function dismissCompactBanner() {
   document.getElementById("compact-banner").style.display = "none";
 }
 
+const _CL_IDS = ["cl-sentinel","cl-lock","cl-compact-tmp","cl-image"];
+function clToggleAll(checked) {
+  _CL_IDS.forEach(id => { document.getElementById(id).checked = checked; });
+}
+function clSyncAll() {
+  const all = document.getElementById("cl-all");
+  if (all) all.checked = _CL_IDS.every(id => document.getElementById(id).checked);
+}
 async function runCleanup() {
   const targets = [];
   if (document.getElementById("cl-sentinel").checked)    targets.push("sentinel");
@@ -4502,7 +4718,7 @@ async function runCleanup() {
     const summary = Object.entries(j.results).map(([k,v]) => `${k}: ${v}`).join(" · ");
     statusEl.textContent = "✓ " + summary;
     // uncheck all
-    ["cl-sentinel","cl-lock","cl-compact-tmp","cl-image"].forEach(id => {
+    ["cl-all","cl-sentinel","cl-lock","cl-compact-tmp","cl-image"].forEach(id => {
       document.getElementById(id).checked = false;
     });
     toast("Cleanup complete", "ok");
@@ -4667,6 +4883,136 @@ async function loadSystem() {
     }
     if (d.hostname) document.getElementById("hdr-sub").textContent = `${d.hostname} — Raspberry Pi image backup`;
   } catch {}
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener("click", loadDashboard);
+
+function dbBadge(id, txtId, label, cls) {
+  const b = document.getElementById(id), t = document.getElementById(txtId);
+  if (!b || !t) return;
+  b.className = "badge " + cls;
+  const dot = b.querySelector(".dot");
+  if (dot) dot.style.background = "";
+  t.textContent = label;
+}
+
+function fmtTs(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, {weekday:"short",day:"numeric",month:"short"})
+       + " · " + d.toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit"});
+}
+
+function nextCronRun(expr) {
+  try {
+    const parts = expr.trim().split(/\s+/);
+    if (parts.length < 5) return "—";
+    const [min, hour, dom, mon, dow] = parts;
+    // Only handle simple weekly/daily cases (no ranges/steps for now)
+    const now = new Date();
+    const candidate = new Date(now);
+    candidate.setSeconds(0); candidate.setMilliseconds(0);
+    candidate.setMinutes(parseInt(min) || 0);
+    candidate.setHours(parseInt(hour) || 0);
+    if (dow !== "*") {
+      const targetDay = parseInt(dow);
+      let daysAhead = targetDay - candidate.getDay();
+      if (daysAhead <= 0) daysAhead += 7;
+      candidate.setDate(candidate.getDate() + daysAhead);
+    } else {
+      if (candidate <= now) candidate.setDate(candidate.getDate() + 1);
+    }
+    if (candidate <= now) candidate.setDate(candidate.getDate() + 7);
+    return candidate.toLocaleDateString(undefined, {weekday:"short",day:"numeric",month:"short"})
+         + " · " + candidate.toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit"});
+  } catch { return "—"; }
+}
+
+async function loadDashboard() {
+  try {
+    const r = await fetch("/api/dashboard");
+    const d = await r.json();
+
+    // ── Last backup ───────────────────────────────────────────────────────────
+    const last = d.last || {};
+    const res  = last.result;
+    if (d.running) {
+      dbBadge("db-backup-badge","db-backup-badge-txt","Running…","orange");
+    } else if (res === "success") {
+      dbBadge("db-backup-badge","db-backup-badge-txt","Success","green");
+    } else if (res === "failed") {
+      dbBadge("db-backup-badge","db-backup-badge-txt","Failed","red");
+    } else {
+      dbBadge("db-backup-badge","db-backup-badge-txt","No data","muted");
+    }
+    document.getElementById("db-started").textContent  = fmtTs(last.started_ts)  || last.started  || "—";
+    document.getElementById("db-finished").textContent = fmtTs(last.finished_ts) || last.finished || "—";
+    document.getElementById("db-elapsed").textContent  = last.elapsed  || "—";
+    document.getElementById("db-mode").textContent     = last.inferred ? "Inferred from sentinel" : (res ? "From log" : "—");
+
+    const logWrap = document.getElementById("db-log-wrap");
+    const logEl   = document.getElementById("db-log");
+    if (last.log_lines && last.log_lines.length) {
+      logEl.innerHTML = last.log_lines.map(l => termLine(l.replace(/\n$/,""), "info")).join("");
+      logWrap.style.display = "";
+      logEl.scrollTop = logEl.scrollHeight;
+    } else {
+      logWrap.style.display = "none";
+    }
+
+    // ── Mount ─────────────────────────────────────────────────────────────────
+    const mnt = d.mount || {};
+    if (mnt.mounted) {
+      dbBadge("db-mount-badge","db-mount-badge-txt","Mounted","green");
+    } else {
+      dbBadge("db-mount-badge","db-mount-badge-txt","Not mounted","red");
+    }
+    document.getElementById("db-mount-src").textContent = mnt.source || "—";
+    document.getElementById("db-mount-fs").textContent  = mnt.fstype || "—";
+
+    // ── Image ─────────────────────────────────────────────────────────────────
+    const img = d.image || {};
+    if (img.exists) {
+      dbBadge("db-image-badge","db-image-badge-txt","Present","green");
+      document.getElementById("db-img-logical").textContent = img.logical_mb != null ? img.logical_mb.toLocaleString() + " MB" : "—";
+      document.getElementById("db-img-sparse").textContent  = img.sparse_mb  != null ? img.sparse_mb.toLocaleString()  + " MB" : "—";
+    } else {
+      dbBadge("db-image-badge","db-image-badge-txt","Not found","muted");
+      document.getElementById("db-img-logical").textContent = "—";
+      document.getElementById("db-img-sparse").textContent  = "—";
+    }
+    document.getElementById("db-sentinel").textContent = d.sentinel ? "Present (incremental)" : "Absent (fresh init)";
+    document.getElementById("db-compact-warn").style.display = img.compact_recommended ? "" : "none";
+
+    // ── Schedule ──────────────────────────────────────────────────────────────
+    const cron = d.cron || {};
+    if (cron.installed) {
+      dbBadge("db-cron-badge","db-cron-badge-txt","Installed","green");
+    } else {
+      dbBadge("db-cron-badge","db-cron-badge-txt","Not set","muted");
+    }
+    document.getElementById("db-cron-expr").textContent = cron.expr || "—";
+    document.getElementById("db-cron-next").textContent = cron.expr ? nextCronRun(cron.expr) : "—";
+
+    // ── State pills ───────────────────────────────────────────────────────────
+    const pr = document.getElementById("db-pill-running");
+    pr.className = d.running ? "badge orange" : "badge muted";
+    pr.textContent = d.running ? "Backup running" : "Backup idle";
+
+    const pl = document.getElementById("db-pill-lock");
+    pl.className = d.lock ? "badge orange" : "badge muted";
+    pl.textContent = d.lock ? "Lock file present" : "No lock";
+
+    const ps = document.getElementById("db-pill-sentinel");
+    ps.className = d.sentinel ? "badge green" : "badge muted";
+    ps.textContent = d.sentinel ? "Sentinel present" : "No sentinel";
+
+    // ── Timestamp ─────────────────────────────────────────────────────────────
+    document.getElementById("db-refresh-ts").textContent =
+      "Last refreshed " + new Date().toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit",second:"2-digit"});
+
+  } catch(e) { toast("Dashboard load failed: " + e.message, "err"); }
 }
 
 // ─── Restore tab ──────────────────────────────────────────────────────────────
@@ -5058,6 +5404,7 @@ loadLastBackup();
 loadDeps();
 loadConfig().then(() => { loadContainers(); checkMountStatus(S.destType); });
 checkImageStatus();
+loadDashboard();
 </script>
 </body>
 </html>"""
