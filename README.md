@@ -18,6 +18,7 @@ You configure your backup destination, schedule, and notification settings throu
 
 ## Features
 
+- Live dashboard: last backup result, mount status, image size, cron schedule, running state + ETA
 - Full Pi image backup via RonR image-backup (incremental after first run)
 - Multi-destination support: iSCSI, USB, SMB, NFS
 - Secondary destinations via rsync after primary backup
@@ -28,7 +29,9 @@ You configure your backup destination, schedule, and notification settings throu
 - Visual cron scheduler
 - ntfy.sh push notifications (start, success, failure)
 - fstab mount-on-boot toggles
+- Reset & Cleanup panel: remove sentinel, lock file, compact temp, and image in one click
 - Basic auth with first-run setup wizard
+- Mobile-responsive layout
 - 100% self-contained single Python file
 
 ---
@@ -77,6 +80,7 @@ PBM_PORT=8080 bash install.sh
 3. Go to the **Config** tab and set your image filename and optional ntfy topic
 4. Go to the **Generate** tab, generate the script, and click **Install Script**
 5. Go to the **Schedule** tab to set your cron schedule
+6. The **Dashboard** tab gives you a live overview at any time — last backup result, mount status, image size, schedule, and running state with ETA
 
 ---
 
@@ -135,17 +139,17 @@ Key config options:
 
 ## Screenshots
 
-| Destination | Containers |
+| Dashboard | Destination |
 |---|---|
-| ![Destination](screenshots/destination.png) | ![Containers](screenshots/containers.png) |
+| ![Dashboard](screenshots/dashboard.png) | ![Destination](screenshots/destination.png) |
 
 | Schedule | Generate |
 |---|---|
 | ![Schedule](screenshots/schedule.png) | ![Generate](screenshots/generate.png) |
 
-| Restore | |
+| Containers | Restore |
 |---|---|
-| ![Restore](screenshots/restore.png) | |
+| ![Containers](screenshots/containers.png) | ![Restore](screenshots/restore.png) |
 
 ---
 
