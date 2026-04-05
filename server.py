@@ -948,6 +948,7 @@ def api_backup_last():
     line = lines[start_idx]
     sep = ": ---"
     out["started"] = line[:line.index(sep)].strip() if sep in line else None
+    out["started_ts"] = _parse_log_ts(out["started"])
 
     # Scan forward from start for success or failure markers
     end_idx = len(lines)
@@ -969,6 +970,13 @@ def api_backup_last():
             break
 
     out["finished_ts"] = _parse_log_ts(out["finished"])
+
+    # If still running, scan backwards for the previous run's elapsed time (for ETA)
+    if out["result"] is None:
+        for i in range(start_idx - 1, -1, -1):
+            if "All done." in lines[i] and "Total elapsed:" in lines[i]:
+                out["prev_elapsed"] = lines[i].split("Total elapsed:")[-1].strip()
+                break
 
     # Collect deduplicated log lines from this run (skip consecutive duplicates)
     snippet, prev = [], None
@@ -1313,7 +1321,7 @@ def api_dashboard():
         try:
             st   = image_path.stat()
             logical_mb = st.st_size // (1024 * 1024)
-            _, out, _ = sh(f"du -s --block-size=1M {shlex.quote(str(image_path))}")
+            out, _, _ = sh(f"du -s --block-size=1M {shlex.quote(str(image_path))}")
             sparse_mb  = int(out.split()[0]) if out.strip() else logical_mb
             image_info = {
                 "exists": True,
@@ -1328,11 +1336,16 @@ def api_dashboard():
     # ── Sentinel / lock ───────────────────────────────────────────────────────
     sentinel_exists = (Path(mount_point) / ".image_initialised").exists()
     lock_exists     = Path(lock_file).exists()
+    # flock only releases on process exit; file persists — test if lock is held
+    lock_held = False
+    if lock_exists:
+        _, _, _flock_rc = sh(f"flock -n {shlex.quote(lock_file)} true")
+        lock_held = (_flock_rc != 0)
 
     # ── Mount status ──────────────────────────────────────────────────────────
     mount_info = {"mounted": False}
     try:
-        _, out, rc = sh(f"findmnt -rn -o TARGET,SOURCE,FSTYPE {shlex.quote(mount_point)}")
+        out, _, rc = sh(f"findmnt -rn -o TARGET,SOURCE,FSTYPE {shlex.quote(mount_point)}")
         if rc == 0 and out.strip():
             parts = out.strip().split()
             mount_info = {
@@ -1347,7 +1360,7 @@ def api_dashboard():
     cron_info = {"installed": False, "expr": "", "human": ""}
     try:
         script_path = cfg.get("scriptPath", str(Path.home() / "weekly_image.sh"))
-        _, out, rc  = sh("crontab -l 2>/dev/null")
+        out, _, rc  = sh("crontab -l 2>/dev/null")
         for line in (out or "").splitlines():
             if script_path in line and not line.strip().startswith("#"):
                 parts = line.strip().split()
@@ -1369,7 +1382,7 @@ def api_dashboard():
         "cron":     cron_info,
         "sentinel": sentinel_exists,
         "lock":     lock_exists,
-        "running":  _backup_status.get("running", False),
+        "running":  _backup_status.get("running", False) or lock_held,
     })
 
 
@@ -1394,9 +1407,14 @@ def api_cleanup():
         _, _, rc = sh("sudo umount -l /tmp/pbm_compact_mnt 2>/dev/null; sudo rm -rf /tmp/pbm_compact_mnt", timeout=15)
         results["compact_tmp"] = "cleaned" if rc == 0 else "cleaned (best-effort)"
     if "image" in targets:
-        p = str(Path(mount_point) / image_name)
-        _, _, rc = sh(f"sudo rm -f {shlex.quote(p)}", timeout=30)
-        results["image"] = "deleted" if rc == 0 else "not found or error"
+        mnt = Path(mount_point)
+        imgs = list(mnt.glob("*.img"))
+        if not imgs:
+            results["image"] = "not found"
+        else:
+            paths = " ".join(shlex.quote(str(p)) for p in imgs)
+            _, _, rc = sh(f"sudo rm -f {paths}", timeout=30)
+            results["image"] = f"deleted {len(imgs)} file(s)" if rc == 0 else "error"
     return jsonify({"ok": True, "results": results})
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1998,11 +2016,11 @@ textarea{resize:vertical;line-height:1.6}
           <span id="db-started">—</span>
         </div>
         <div class="row" style="gap:10px">
-          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Finished</span>
+          <span id="db-finished-lbl" style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Finished</span>
           <span id="db-finished">—</span>
         </div>
         <div class="row" style="gap:10px">
-          <span style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Duration</span>
+          <span id="db-elapsed-lbl" style="color:var(--muted);min-width:64px;font-size:11px;text-transform:uppercase;letter-spacing:.07em">Duration</span>
           <span id="db-elapsed">—</span>
         </div>
         <div class="row" style="gap:10px">
@@ -4929,6 +4947,18 @@ function nextCronRun(expr) {
   } catch { return "—"; }
 }
 
+let _dbTimer = null;
+function parseElapsedSecs(s) {
+  let secs = 0;
+  const h = s.match(/(\d+)h/); if (h) secs += parseInt(h[1]) * 3600;
+  const m = s.match(/(\d+)m/); if (m) secs += parseInt(m[1]) * 60;
+  const sc = s.match(/(\d+)s/); if (sc) secs += parseInt(sc[1]);
+  return secs;
+}
+function fmtElapsed(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return h ? `${h}h ${m}m ${sec}s` : m ? `${m}m ${sec}s` : `${sec}s`;
+}
 async function loadDashboard() {
   try {
     const r = await fetch("/api/dashboard");
@@ -4937,19 +4967,40 @@ async function loadDashboard() {
     // ── Last backup ───────────────────────────────────────────────────────────
     const last = d.last || {};
     const res  = last.result;
+    if (_dbTimer) { clearInterval(_dbTimer); _dbTimer = null; }
     if (d.running) {
       dbBadge("db-backup-badge","db-backup-badge-txt","Running…","orange");
-    } else if (res === "success") {
-      dbBadge("db-backup-badge","db-backup-badge-txt","Success","green");
-    } else if (res === "failed") {
-      dbBadge("db-backup-badge","db-backup-badge-txt","Failed","red");
+      document.getElementById("db-started").textContent = fmtTs(last.started_ts) || last.started || "—";
+      document.getElementById("db-finished-lbl").textContent = "ETA";
+      if (last.started_ts && last.prev_elapsed) {
+        const etaTs = last.started_ts + parseElapsedSecs(last.prev_elapsed);
+        document.getElementById("db-finished").textContent = fmtTs(etaTs) + " (est.)";
+      } else {
+        document.getElementById("db-finished").textContent = "—";
+      }
+      document.getElementById("db-elapsed-lbl").textContent = "Running for";
+      if (last.started_ts) {
+        const tick = () => {
+          const s = Math.max(0, Math.floor(Date.now()/1000) - last.started_ts);
+          document.getElementById("db-elapsed").textContent = fmtElapsed(s);
+        };
+        tick();
+        _dbTimer = setInterval(tick, 1000);
+      } else {
+        document.getElementById("db-elapsed").textContent = "—";
+      }
+      document.getElementById("db-mode").textContent = "—";
     } else {
-      dbBadge("db-backup-badge","db-backup-badge-txt","No data","muted");
+      dbBadge("db-backup-badge","db-backup-badge-txt",
+        res === "success" ? "Success" : res === "failed" ? "Failed" : "No data",
+        res === "success" ? "green"   : res === "failed" ? "red"    : "muted");
+      document.getElementById("db-finished-lbl").textContent = "Finished";
+      document.getElementById("db-elapsed-lbl").textContent  = "Duration";
+      document.getElementById("db-started").textContent  = fmtTs(last.started_ts)  || last.started  || "—";
+      document.getElementById("db-finished").textContent = fmtTs(last.finished_ts) || last.finished || "—";
+      document.getElementById("db-elapsed").textContent  = last.elapsed  || "—";
+      document.getElementById("db-mode").textContent     = last.inferred ? "Inferred from sentinel" : (res ? "From log" : "—");
     }
-    document.getElementById("db-started").textContent  = fmtTs(last.started_ts)  || last.started  || "—";
-    document.getElementById("db-finished").textContent = fmtTs(last.finished_ts) || last.finished || "—";
-    document.getElementById("db-elapsed").textContent  = last.elapsed  || "—";
-    document.getElementById("db-mode").textContent     = last.inferred ? "Inferred from sentinel" : (res ? "From log" : "—");
 
     const logWrap = document.getElementById("db-log-wrap");
     const logEl   = document.getElementById("db-log");
